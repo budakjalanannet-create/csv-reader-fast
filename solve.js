@@ -1,8 +1,10 @@
 // Fast drop-in replacement for csv-reader 1.0.0: same answers, byte for byte, on every input.
-// One left-to-right pass. Unquoted fields are scanned inline and taken as slices of the input;
-// quoted fields jump from quote to quote with indexOf. A parts list is built only for the rare
-// field that needs characters dropped or rewritten (a stray CR, a doubled quote, a CR in quotes).
-// Errors are recorded in the order met, exactly as the reference records them.
+// Most records are read by one inlined scanner that walks the record once, slicing fields out of
+// the input and jumping between commas with indexOf where that pays. A record containing anything
+// unusual (a stray CR, junk after a closing quote, an unterminated quote) is restarted and read by
+// the general path below, which follows the reference's behaviour step for step: cached next-LF /
+// next-CR positions, quote-to-quote jumps inside quoted fields, and a plain character scanner for
+// the messy fields. Errors are recorded in the order met, exactly as the reference records them.
 
 const COMMA = 0;
 const LINE_BREAK = 1;
@@ -24,10 +26,19 @@ export function run(input) {
   let recordLine = 1;
   let recordRow = null;
 
-  // The field most recently read by readUnquoted / readQuoted.
+  // The field most recently read by readUnquoted / readQuoted (general path).
   let fValue = '';
   let fEnded = END;
   let fAdded = 0;
+
+  // Cached next-LF and next-CR positions for the record being read; -2 means dirty (refill on use).
+  let nLF = -2;
+  let nCR = -2;
+
+  function refillBreaks() {
+    if (nLF === -2 || (nLF >= 0 && nLF < pos)) nLF = text.indexOf('\n', pos);
+    if (nCR === -2 || (nCR >= 0 && nCR < pos)) nCR = text.indexOf('\r', pos);
+  }
 
   function countLF(a, b) {
     let n = 0;
@@ -102,19 +113,39 @@ export function run(input) {
     while (i < len) {
       const q = text.indexOf('"', i);
       if (q === -1) break; // no closing quote anywhere: unterminated
-      const r = text.indexOf('\r', i);
-      if (r !== -1 && r < q) {
-        // CRLF and a lone CR inside quotes are each one LF.
-        line += countLF(i, r) + 1;
-        if (parts === null) parts = [];
-        parts.push(text.slice(segStart, r), '\n');
-        i = r + (text.charCodeAt(r + 1) === 10 ? 2 : 1);
-        segStart = i;
-        continue;
+      if (q > i) {
+        if (q - i <= 56) {
+          let crAt = -1;
+          let lf = 0;
+          for (let j = i; j < q; j++) {
+            const cc = text.charCodeAt(j);
+            if (cc === 13) { crAt = j; break; }
+            if (cc === 10) lf += 1;
+          }
+          if (crAt === -1) {
+            line += lf;
+          } else {
+            line += lf + 1;
+            if (parts === null) parts = [];
+            parts.push(text.slice(segStart, crAt), '\n');
+            i = crAt + (text.charCodeAt(crAt + 1) === 10 ? 2 : 1);
+            segStart = i;
+            continue;
+          }
+        } else {
+          const r = text.indexOf('\r', i);
+          if (r !== -1 && r < q) {
+            line += countLF(i, r) + 1;
+            if (parts === null) parts = [];
+            parts.push(text.slice(segStart, r), '\n');
+            i = r + (text.charCodeAt(r + 1) === 10 ? 2 : 1);
+            segStart = i;
+            continue;
+          }
+          line += countLF(i, q);
+        }
       }
-      line += countLF(i, q);
       if (text.charCodeAt(q + 1) === 34) {
-        // A doubled quote is one quote.
         if (parts === null) parts = [];
         parts.push(text.slice(segStart, q), '"');
         i = q + 2;
@@ -131,6 +162,8 @@ export function run(input) {
         value = parts.join('');
       }
       i = q + 1;
+      nLF = -2;
+      nCR = -2;
       if (i >= len) {
         fValue = value;
         fEnded = END;
@@ -167,8 +200,158 @@ export function run(input) {
     // The quote never closes: it is a literal character, and the text after it is read again as unquoted.
     pos = open + 1;
     line = openLine;
+    nLF = -2;
+    nCR = -2;
     errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
     readUnquoted('"');
+  }
+
+  // The general record parse: fields into `fields`, sets `quoted` for the record's last field.
+  function readRecordGeneral(fields) {
+    let quoted = false;
+    nLF = -2;
+    nCR = -2;
+    do {
+      if (text.charCodeAt(pos) === 34) {
+        quoted = true;
+        readQuoted();
+        fields.push(fValue);
+      } else {
+        quoted = false;
+        refillBreaks();
+        const nc = text.indexOf(',', pos);
+        if (nc !== -1 && (nLF === -1 || nc < nLF) && (nCR === -1 || nc < nCR)) {
+          fields.push(text.slice(pos, nc));
+          fEnded = COMMA;
+          pos = nc + 1;
+        } else if (nCR !== -1 && (nLF === -1 || nCR < nLF)) {
+          if (text.charCodeAt(nCR + 1) === 10) {
+            fields.push(text.slice(pos, nCR));
+            fEnded = LINE_BREAK;
+            pos = nCR + 2;
+            line += 1;
+          } else {
+            readUnquoted('');
+            fields.push(fValue);
+            nLF = -2;
+            nCR = -2;
+          }
+        } else if (nLF !== -1) {
+          fields.push(text.slice(pos, nLF));
+          fEnded = LINE_BREAK;
+          pos = nLF + 1;
+          line += 1;
+        } else {
+          fields.push(text.slice(pos, len));
+          fEnded = END;
+          pos = len;
+        }
+      }
+    } while (fEnded === COMMA);
+    return quoted;
+  }
+
+  // The clean record parse: one inlined pass over a record with nothing unusual in it.
+  // On success returns the fields array and sets cleanQuoted; on anything unusual returns null
+  // (pos and line are then restored by the caller and the general path reads the record).
+  let cleanQuoted = false;
+  function readRecordClean() {
+    const fields = [];
+    let i = pos;
+    cleanQuoted = false;
+    fieldLoop: while (true) {
+      if (text.charCodeAt(i) === 34) {
+        cleanQuoted = true;
+        i += 1;
+        let segStart = i;
+        let parts = null;
+        while (i < len) {
+          const c = text.charCodeAt(i);
+          if (c === 34) {
+            if (text.charCodeAt(i + 1) === 34) {
+              if (parts === null) parts = [];
+              parts.push(text.slice(segStart, i), '"');
+              i += 2;
+              segStart = i;
+              continue;
+            }
+            let value;
+            if (parts === null) {
+              value = text.slice(segStart, i);
+            } else {
+              parts.push(text.slice(segStart, i));
+              value = parts.join('');
+            }
+            i += 1;
+            fields.push(value);
+            if (i >= len) {
+              pos = i;
+              return fields;
+            }
+            const d = text.charCodeAt(i);
+            if (d === 44) {
+              i += 1;
+              continue fieldLoop;
+            }
+            if (d === 10) {
+              i += 1;
+              line += 1;
+              pos = i;
+              return fields;
+            }
+            if (d === 13 && text.charCodeAt(i + 1) === 10) {
+              i += 2;
+              line += 1;
+              pos = i;
+              return fields;
+            }
+            return null; // junk after the closing quote
+          }
+          if (c === 13) {
+            if (parts === null) parts = [];
+            parts.push(text.slice(segStart, i), '\n');
+            line += 1;
+            i += text.charCodeAt(i + 1) === 10 ? 2 : 1;
+            segStart = i;
+            continue;
+          }
+          if (c === 10) line += 1;
+          i += 1;
+        }
+        return null; // the quote never closes
+      }
+      cleanQuoted = false;
+      const fs = i;
+      while (i < len) {
+        const c = text.charCodeAt(i);
+        if (c === 44) {
+          fields.push(text.slice(fs, i));
+          i += 1;
+          continue fieldLoop;
+        }
+        if (c === 10) {
+          fields.push(text.slice(fs, i));
+          i += 1;
+          line += 1;
+          pos = i;
+          return fields;
+        }
+        if (c === 13) {
+          if (text.charCodeAt(i + 1) === 10) {
+            fields.push(text.slice(fs, i));
+            i += 2;
+            line += 1;
+            pos = i;
+            return fields;
+          }
+          return null; // a stray CR
+        }
+        i += 1;
+      }
+      fields.push(text.slice(fs, len));
+      pos = len;
+      return fields;
+    }
   }
 
   while (true) {
@@ -189,57 +372,18 @@ export function run(input) {
 
     recordLine = line;
     recordRow = header && columns === null ? null : rows.length;
-    const fields = [];
-    let quoted = false;
-    do {
-      if (text.charCodeAt(pos) === 34) {
-        quoted = true;
-        readQuoted();
-        fields.push(fValue);
-      } else {
-        quoted = false;
-        // Inline unquoted scan: slice the field out; a stray CR delegates the whole field.
-        const start = pos;
-        let i = pos;
-        let delegated = false;
-        fEnded = END;
-        while (i < len) {
-          const c = text.charCodeAt(i);
-          if (c === 44) {
-            fEnded = COMMA;
-            fields.push(text.slice(start, i));
-            i += 1;
-            break;
-          }
-          if (c === 10) {
-            fEnded = LINE_BREAK;
-            fields.push(text.slice(start, i));
-            i += 1;
-            line += 1;
-            break;
-          }
-          if (c === 13) {
-            if (text.charCodeAt(i + 1) === 10) {
-              fEnded = LINE_BREAK;
-              fields.push(text.slice(start, i));
-              i += 2;
-              line += 1;
-            } else {
-              pos = start;
-              readUnquoted('');
-              fields.push(fValue);
-              delegated = true;
-            }
-            break;
-          }
-          i += 1;
-        }
-        if (!delegated) {
-          if (fEnded === END) fields.push(text.slice(start, len));
-          pos = i;
-        }
-      }
-    } while (fEnded === COMMA);
+    const savePos = pos;
+    const saveLine = line;
+    let fields = readRecordClean();
+    let quoted;
+    if (fields !== null) {
+      quoted = cleanQuoted;
+    } else {
+      pos = savePos;
+      line = saveLine;
+      fields = [];
+      quoted = readRecordGeneral(fields);
+    }
 
     // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
     if (fields.length === 1 && fields[0] === '' && !quoted) continue;
